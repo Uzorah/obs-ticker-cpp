@@ -13,6 +13,10 @@
 #include <QVBoxLayout>
 #include <QVector>
 #include <QWidget>
+#include <QSettings>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
 #include <obs-frontend-api.h>
 #include <obs.h>
 
@@ -230,6 +234,9 @@ public:
     void deletePreset(const QString &id);
 
     void pushToSource();
+
+    void saveState();
+    void loadState();
 
 signals:
     void messagesChanged();

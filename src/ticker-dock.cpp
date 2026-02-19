@@ -199,6 +199,7 @@ TickerDock::TickerDock(QWidget *parent)
     : QWidget(parent)
 {
     s_instance = this;
+    setObjectName("ticker_control_dock");
 
     // Default messages matching the React sample data
     m_messages = {
@@ -244,10 +245,14 @@ TickerDock::TickerDock(QWidget *parent)
     connect(this, &TickerDock::settingsChanged, m_goLiveTab,  &GoLiveTab::refresh);
     connect(this, &TickerDock::presetsChanged,  m_formattingTab, &FormattingTab::refreshPresets);
 
+    // Load saved state (overrides defaults)
+    loadState();
+    m_formattingTab->loadFromSettings();
+
     // Push settings to the OBS source once it's been placed in a scene.
     // We retry every 500 ms; the timer stops itself once the source is found.
     auto *startupTimer = new QTimer(this);
-    startupTimer->setInterval(500);
+    startupTimer->setInterval(50);
     connect(startupTimer, &QTimer::timeout, this, [this, startupTimer]() {
         obs_source_t *src = ticker_find_source();
         if (src) {
@@ -261,6 +266,7 @@ TickerDock::TickerDock(QWidget *parent)
 
 TickerDock::~TickerDock()
 {
+    saveState();
     s_instance = nullptr;
 }
 
@@ -426,6 +432,141 @@ void TickerDock::pushToSource()
     ticker_push_settings(m_settings, messagesStr);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// State Persistence (QSettings)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helpers to serialize/deserialize Settings
+static QJsonObject settingsToJson(const TickerSettings &s)
+{
+    QJsonObject o;
+    o["height"]          = s.height;
+    o["speed"]           = s.speed;
+    o["backgroundColor"] = s.backgroundColor;
+    o["fontFamily"]      = s.fontFamily;
+    o["fontStyleName"]   = s.fontStyleName;
+    o["fontSize"]        = s.fontSize;
+    o["color"]           = s.color;
+    o["itemSeparator"]   = s.itemSeparator;
+    o["fontScaleX"]      = s.fontScaleX;
+    o["fontScaleY"]      = s.fontScaleY;
+    o["showClock"]       = s.showClock;
+    o["clockFormat"]     = s.clockFormat;
+    o["clockFontSize"]   = s.clockFontSize;
+    o["clockScaleX"]     = s.clockScaleX;
+    o["clockScaleY"]     = s.clockScaleY;
+    o["clockZoneWidth"]  = s.clockZoneWidth;
+    o["clockSepColor"]   = s.clockSepColor;
+    o["isLive"]          = s.isLive;
+    return o;
+}
+
+static TickerSettings jsonToSettings(const QJsonObject &o, const TickerSettings &def)
+{
+    TickerSettings s = def; // fallback to defaults if keys missing
+    if (o.contains("height"))          s.height          = o["height"].toInt();
+    if (o.contains("speed"))           s.speed           = o["speed"].toInt();
+    if (o.contains("backgroundColor")) s.backgroundColor = o["backgroundColor"].toString();
+    if (o.contains("fontFamily"))      s.fontFamily      = o["fontFamily"].toString();
+    if (o.contains("fontStyleName"))   s.fontStyleName   = o["fontStyleName"].toString();
+    if (o.contains("fontSize"))        s.fontSize        = o["fontSize"].toInt();
+    if (o.contains("color"))           s.color           = o["color"].toString();
+    if (o.contains("itemSeparator"))   s.itemSeparator   = o["itemSeparator"].toString();
+    if (o.contains("fontScaleX"))      s.fontScaleX      = o["fontScaleX"].toDouble();
+    if (o.contains("fontScaleY"))      s.fontScaleY      = o["fontScaleY"].toDouble();
+    if (o.contains("showClock"))       s.showClock       = o["showClock"].toBool();
+    if (o.contains("clockFormat"))     s.clockFormat     = o["clockFormat"].toString();
+    if (o.contains("clockFontSize"))   s.clockFontSize   = o["clockFontSize"].toInt();
+    if (o.contains("clockScaleX"))     s.clockScaleX     = o["clockScaleX"].toDouble();
+    if (o.contains("clockScaleY"))     s.clockScaleY     = o["clockScaleY"].toDouble();
+    if (o.contains("clockZoneWidth"))  s.clockZoneWidth  = o["clockZoneWidth"].toInt();
+    if (o.contains("clockSepColor"))   s.clockSepColor   = o["clockSepColor"].toString();
+    if (o.contains("isLive"))          s.isLive          = o["isLive"].toBool();
+    return s;
+}
+
+void TickerDock::saveState()
+{
+    QSettings s("OBS", "TickerPlugin");
+
+    // 1. Settings
+    s.setValue("settings", QJsonDocument(settingsToJson(m_settings)).toVariant());
+
+    // 2. Messages
+    QJsonArray msgArr;
+    for (const auto &m : m_messages) {
+        QJsonObject o;
+        o["id"]        = m.id;
+        o["text"]      = m.text;
+        o["active"]    = m.active;
+        o["temporary"] = m.temporary;
+        msgArr.append(o);
+    }
+    s.setValue("messages", QJsonDocument(msgArr).toVariant());
+
+    // 3. Presets
+    QJsonArray preArr;
+    for (const auto &p : m_presets) {
+        QJsonObject o;
+        o["id"]       = p.id;
+        o["name"]     = p.name;
+        o["settings"] = settingsToJson(p.settings);
+        preArr.append(o);
+    }
+    s.setValue("presets", QJsonDocument(preArr).toVariant());
+}
+
+void TickerDock::loadState()
+{
+    QSettings s("OBS", "TickerPlugin");
+    if (!s.contains("settings")) return; // No save data
+
+    // 1. Settings
+    QJsonDocument sDoc = QJsonDocument::fromVariant(s.value("settings"));
+    if (!sDoc.isNull() && sDoc.isObject()) {
+        m_settings = jsonToSettings(sDoc.object(), m_settings);
+    }
+    
+    // FORCE "Off" state on startup, ignoring saved state
+    m_settings.isLive = false;
+
+    // 2. Messages
+    QJsonDocument mDoc = QJsonDocument::fromVariant(s.value("messages"));
+    if (!mDoc.isNull() && mDoc.isArray()) {
+        m_messages.clear();
+        QJsonArray arr = mDoc.array();
+        for (const auto &val : arr) {
+            QJsonObject o = val.toObject();
+            TickerMessage msg;
+            msg.id        = o["id"].toString();
+            msg.text      = o["text"].toString();
+            msg.active    = o["active"].toBool();
+            msg.temporary = o["temporary"].toBool();
+            m_messages.append(msg);
+        }
+    }
+
+    // 3. Presets
+    QJsonDocument pDoc = QJsonDocument::fromVariant(s.value("presets"));
+    if (!pDoc.isNull() && pDoc.isArray()) {
+        m_presets.clear();
+        QJsonArray arr = pDoc.array();
+        for (const auto &val : arr) {
+            QJsonObject o = val.toObject();
+            TickerPreset p;
+            p.id       = o["id"].toString();
+            p.name     = o["name"].toString();
+            p.settings = jsonToSettings(o["settings"].toObject(), TickerSettings());
+            m_presets.append(p);
+        }
+    }
+
+    // Force UI refresh
+    emit settingsChanged();
+    emit messagesChanged();
+    emit presetsChanged();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GoLiveTab
 // ═══════════════════════════════════════════════════════════════════════════
@@ -528,8 +669,16 @@ GoLiveTab::GoLiveTab(TickerDock *dock, QWidget *parent)
 
         obs_data_t *s = obs_source_get_settings(src);
         int state = (int)obs_data_get_int(s, "runtime_state");
+        bool sourceLive = obs_data_get_bool(s, "is_live");
         obs_data_release(s);
         obs_source_release(src);
+
+        // Sync dock if source changed externally (e.g. Lua hotkey)
+        if (m_dock->settings().isLive != sourceLive) {
+            TickerSettings set = m_dock->settings();
+            set.isLive = sourceLive;
+            m_dock->applySettings(set);
+        }
 
         // state: 0=STOPPED, 1=ACTIVE, 2=STOPPING
         bool isLiveDesired = m_dock->settings().isLive;
