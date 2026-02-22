@@ -91,67 +91,56 @@ static uint64_t chain_counter = 0;
 
 static void append_texts_to_chain(struct ticker_source *ctx, TickerChain &chain, const std::vector<std::string> &texts)
 {
-	// Safety constant: Max estimated width per source to avoid D3D11 crashes (16384 limit)
-	// We use a safe margin (e.g. 8000) because actual font width varies.
 	const int MAX_PIXEL_WIDTH = 8000;
 
-	struct ProcessedItem {
-		std::string text;
-		bool add_separator;
-	};
-	std::vector<ProcessedItem> processed_items;
-
-	for (const auto &original_text : texts) {
-		if (original_text.empty())
-			continue;
-
-		// Crude estimation: Average char width ~0.5 * font_size
-		int estimated_char_width = ctx->font_size / 2;
-		if (estimated_char_width < 1)
-			estimated_char_width = 1;
-
-		int max_chars = MAX_PIXEL_WIDTH / estimated_char_width;
-		if (max_chars < 1)
-			max_chars = 1;
-
-		if ((int)original_text.length() <= max_chars) {
-			processed_items.push_back({original_text, true});
-		} else {
-			// Split long text
-			std::string temp = original_text;
-			while ((int)temp.length() > max_chars) {
-				processed_items.push_back({temp.substr(0, max_chars), false});
-				temp = temp.substr(max_chars);
-			}
-			if (!temp.empty()) {
-				processed_items.push_back({temp, true});
-			}
+	// Create one combined string with separators
+	std::string combined;
+	for (size_t i = 0; i < texts.size(); ++i) {
+		combined += texts[i];
+		if (i < texts.size() - 1) {
+			combined += ctx->sep_text;
 		}
 	}
+	// Add one final separator at the end of the whole chain for looping
+	combined += ctx->sep_text;
 
-	for (size_t i = 0; i < processed_items.size(); ++i) {
+	// Split the combined string only if it's too long
+	std::vector<std::string> chunks;
+	int estimated_char_width = ctx->font_size / 2;
+	if (estimated_char_width < 1)
+		estimated_char_width = 1;
+	int max_chars = MAX_PIXEL_WIDTH / estimated_char_width;
+	if (max_chars < 1)
+		max_chars = 1;
+
+	if ((int)combined.length() <= max_chars) {
+		chunks.push_back(combined);
+	} else {
+		std::string temp = combined;
+		while ((int)temp.length() > max_chars) {
+			chunks.push_back(temp.substr(0, max_chars));
+			temp = temp.substr(max_chars);
+		}
+		if (!temp.empty())
+			chunks.push_back(temp);
+	}
+
+	for (size_t i = 0; i < chunks.size(); ++i) {
 		char name[128];
 		snprintf(name, sizeof(name), "ticker_item_%llu_%zu", (unsigned long long)++chain_counter, i);
 		obs_source_t *ms = obs_source_create_private("text_ft2_source", name, nullptr);
 		if (ms) {
-			ft2_push(ms, processed_items[i].text.c_str(), ctx->font_face.c_str(), ctx->font_style.c_str(),
-				 ctx->font_size, ctx->text_color);
+			ft2_push(ms, chunks[i].c_str(), ctx->font_face.c_str(), ctx->font_style.c_str(), ctx->font_size,
+				 ctx->text_color);
 
-			// Measure immediately (might be 0 first frame, but we try)
 			float w = (float)obs_source_get_width(ms) * ctx->scale_x;
 			chain.width += w;
 		}
 
 		TickerItem item;
 		item.source = ms;
-		item.show_separator = processed_items[i].add_separator;
+		item.show_separator = false; // Separators are now baked into the string
 		chain.items.push_back(item);
-
-		// Add separator width (shared source)
-		if (item.show_separator && ctx->sep_source) {
-			float sw = (float)obs_source_get_width(ctx->sep_source) * ctx->scale_x;
-			chain.width += sw;
-		}
 	}
 }
 
@@ -226,6 +215,7 @@ static void *ticker_create(obs_data_t *settings, obs_source_t *source)
 
 	ctx->sep_source = obs_source_create_private("text_ft2_source", "ticker_sep", nullptr);
 	ctx->clock_source = obs_source_create_private("text_ft2_source", "ticker_clock", nullptr);
+	ctx->height_ref_source = obs_source_create_private("text_ft2_source", "ticker_h_ref", nullptr);
 
 	ticker_update(ctx, settings);
 
@@ -250,6 +240,8 @@ static void ticker_destroy(void *data)
 		obs_source_release(ctx->sep_source);
 	if (ctx->clock_source)
 		obs_source_release(ctx->clock_source);
+	if (ctx->height_ref_source)
+		obs_source_release(ctx->height_ref_source);
 	delete ctx;
 }
 
@@ -332,8 +324,7 @@ static void ticker_update(void *data, obs_data_t *settings)
 
 	const char *raw = obs_data_get_string(settings, "messages");
 	if (raw) {
-		std::vector<std::string> new_texts = split_lines(raw);
-		ctx->pending_msg_texts = new_texts;
+		ctx->pending_msg_texts = split_lines(raw);
 	}
 
 	// Update existing chains style instead of destroying them
@@ -350,6 +341,10 @@ static void ticker_update(void *data, obs_data_t *settings)
 	if (clock_dirty && ctx->clock_source)
 		ft2_push(ctx->clock_source, current_time_str(ctx->clock_24h).c_str(), ctx->font_face.c_str(),
 			 ctx->font_style.c_str(), ctx->clock_font_size, ctx->text_color);
+
+	if (font_dirty && ctx->height_ref_source)
+		ft2_push(ctx->height_ref_source, "|Tgj_0123", ctx->font_face.c_str(), ctx->font_style.c_str(),
+			 ctx->font_size, ctx->text_color);
 }
 
 /* ── Tick ─────────────────────────────────────────────────────────── */
@@ -362,6 +357,9 @@ static void ticker_video_tick(void *data, float seconds)
 	std::lock_guard<std::mutex> lock(ctx->mutex);
 
 	float scroll_area = ctx->show_clock ? (float)(1920 - ctx->clock_zone_width) : 1920.0f;
+
+	// Seamless content tracking
+	// We'll handle additions and next-loop updates below.
 
 	// ── Edge-detect is_live changes ──
 	if (ctx->is_live && !ctx->prev_is_live) {
@@ -443,6 +441,8 @@ static void ticker_video_tick(void *data, float seconds)
 	}
 	ctx->prev_is_live = ctx->is_live;
 
+	// ... (Seamless updates handled in loop spawning and appending)
+
 	// ── State machine ──
 	float slide_speed = 1.0f / SLIDE_DURATION;
 
@@ -482,36 +482,57 @@ static void ticker_video_tick(void *data, float seconds)
 	case TickerAnim::ENTERING: // Treated same as running now
 	case TickerAnim::DRAINING:
 
-		// ── Message Appending Logic ──
-		// Check if pending messages are an extension of current messages
-		if (ctx->pending_msg_texts.size() > ctx->current_msg_texts.size()) {
-			bool is_append = true;
-			for (size_t i = 0; i < ctx->current_msg_texts.size(); ++i) {
-				if (ctx->pending_msg_texts[i] != ctx->current_msg_texts[i]) {
-					is_append = false;
-					break;
+		// ── Seamless Content Update ──
+		if (ctx->pending_msg_texts != ctx->current_msg_texts) {
+			bool is_pure_addition = (ctx->pending_msg_texts.size() > ctx->current_msg_texts.size());
+			if (is_pure_addition) {
+				for (size_t i = 0; i < ctx->current_msg_texts.size(); ++i) {
+					if (ctx->pending_msg_texts[i] != ctx->current_msg_texts[i]) {
+						is_pure_addition = false;
+						break;
+					}
 				}
 			}
 
-			if (is_append) {
-				// Extract new items
-				std::vector<std::string> new_items;
-				for (size_t i = ctx->current_msg_texts.size(); i < ctx->pending_msg_texts.size(); ++i) {
-					new_items.push_back(ctx->pending_msg_texts[i]);
-				}
-
-				// Append to active chains that are still visible (or entering).
-				// If a chain has fully exited to the left, we skip appending to it.
-				// This prevents "ghost" messages from being added to the previous loop
-				// (which would cause the current loop to jump/shift), and ensures
-				// the new message appears seamlessly at the end of the *current* loop.
-				for (auto &chain : ctx->active_chains) {
-					if (chain.x + chain.width > 0.0f) {
-						append_texts_to_chain(ctx, chain, new_items);
+			if (is_pure_addition) {
+				// Append logic: If the last chain hasn't entered yet, we can grow it.
+				if (!ctx->active_chains.empty()) {
+					TickerChain &back = ctx->active_chains.back();
+					if (back.x + back.width > scroll_area) {
+						std::vector<std::string> new_items;
+						for (size_t i = ctx->current_msg_texts.size();
+						     i < ctx->pending_msg_texts.size(); ++i) {
+							new_items.push_back(ctx->pending_msg_texts[i]);
+						}
+						append_texts_to_chain(ctx, back, new_items);
+						ctx->current_msg_texts = ctx->pending_msg_texts;
 					}
+				} else {
+					ctx->current_msg_texts = ctx->pending_msg_texts;
 				}
-
-				// Update current snapshot
+			} else {
+				// Removal/Change: Prune off-screen items from all existing chains.
+				// This allows on-screen items to finish their pass ("drain out").
+				for (auto &chain : ctx->active_chains) {
+					float x_offset = 0.0f;
+					auto it = chain.items.begin();
+					while (it != chain.items.end()) {
+						float item_w = (float)obs_source_get_width(it->source) * ctx->scale_x;
+						if (chain.x + x_offset >= scroll_area) {
+							// Item starts off-screen: remove it and everything after.
+							while (it != chain.items.end()) {
+								if (it->source)
+									obs_source_release(it->source);
+								it = chain.items.erase(it);
+							}
+							break;
+						}
+						x_offset += item_w;
+						++it;
+					}
+					// Re-measure width
+					chain.width = x_offset;
+				}
 				ctx->current_msg_texts = ctx->pending_msg_texts;
 			}
 		}
@@ -689,24 +710,30 @@ static void ticker_video_render(void *data, gs_effect_t *)
 
 	// Render chains
 	for (auto &chain : ctx->active_chains) {
-		// Optimization: Don't render if completely off-screen
 		if (chain.x > scroll_w || chain.x + chain.width < 0)
 			continue;
 
 		float x = chain.x;
 		for (auto &item : chain.items) {
-			// Item text
 			if (item.source) {
 				float w = (float)obs_source_get_width(item.source);
 				float h = (float)obs_source_get_height(item.source);
-				// Safety: Only render if dimensions are valid.
-				// Avoid rendering 0-width items which might crash or cause artifacts.
+
+				// Stable height reference calculation
+				float h_ref = (float)ctx->font_size * 1.3f; // Default based on font size
+				if (ctx->height_ref_source) {
+					float hr = (float)obs_source_get_height(ctx->height_ref_source);
+					if (hr > 1.0f)
+						h_ref = hr;
+				}
+
 				if (w > 1.0f && h > 1.0f) {
-					// Center this item vertically based on its own height
-					// Heuristic: subtract 12% of height to account for font baseline/ascent bias
-					float visual_adj = h * ctx->scale_y * 0.12f;
-					float text_y = (bar_h - h * ctx->scale_y) * 0.5f + (float)ctx->vertical_offset -
-						       visual_adj;
+					// Use h_ref for deterministic vertical positioning across chunks and chains.
+					// This aligns them to the same "bounding box center", which for a fixed font
+					// and reference string |Tgj_0123 effectively aligns baselines.
+					float visual_adj = h_ref * ctx->scale_y * 0.12f;
+					float text_y = (bar_h - h_ref * ctx->scale_y) * 0.5f +
+						       (float)ctx->vertical_offset - visual_adj;
 
 					gs_matrix_push();
 					gs_matrix_translate3f(x, text_y, 0.0f);
@@ -715,23 +742,6 @@ static void ticker_video_render(void *data, gs_effect_t *)
 					gs_matrix_pop();
 				}
 				x += w * ctx->scale_x;
-			}
-			// Separator
-			if (item.show_separator && ctx->sep_source) {
-				float sw = (float)obs_source_get_width(ctx->sep_source);
-				float sh = (float)obs_source_get_height(ctx->sep_source);
-				if (sw > 1.0f && sh > 1.0f) {
-					float visual_adj = sh * ctx->scale_y * 0.12f;
-					float sep_y = (bar_h - sh * ctx->scale_y) * 0.5f + (float)ctx->vertical_offset -
-						      visual_adj;
-
-					gs_matrix_push();
-					gs_matrix_translate3f(x, sep_y, 0.0f);
-					gs_matrix_scale3f(ctx->scale_x, ctx->scale_y, 1.0f);
-					obs_source_video_render(ctx->sep_source);
-					gs_matrix_pop();
-				}
-				x += sw * ctx->scale_x;
 			}
 		}
 	}
@@ -823,4 +833,5 @@ void ticker_source_init()
 	ticker_source_info.get_width = ticker_get_width;
 	ticker_source_info.get_height = ticker_get_height;
 	ticker_source_info.enum_active_sources = ticker_enum_active_sources;
+	obs_register_source(&ticker_source_info);
 }

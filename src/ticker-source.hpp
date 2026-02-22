@@ -73,6 +73,7 @@ struct ticker_source {
 	// But separators are identical. We can share one 'sep_source' for all chains?
 	// YES. We can reuse 'sep_source' for all separators in all chains to save memory.
 	obs_source_t *sep_source = nullptr;
+	obs_source_t *height_ref_source = nullptr;
 
 	/* Clock */
 	obs_source_t *clock_source = nullptr;
