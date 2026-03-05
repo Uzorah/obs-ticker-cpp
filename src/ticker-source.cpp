@@ -8,7 +8,6 @@
 #include <cstring>
 #include <sstream>
 #include <cmath>
-#include <limits>
 #include <algorithm>
 #include <cstdio>
 
@@ -17,6 +16,7 @@
 static void ticker_update(void *data, obs_data_t *settings);
 static uint32_t ticker_get_width(void *data);
 static uint32_t ticker_get_height(void *data);
+static void update_chain_width(struct ticker_source *ctx, TickerChain &chain);
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
@@ -91,56 +91,24 @@ static uint64_t chain_counter = 0;
 
 static void append_texts_to_chain(struct ticker_source *ctx, TickerChain &chain, const std::vector<std::string> &texts)
 {
-	const int MAX_PIXEL_WIDTH = 8000;
-
-	// Create one combined string with separators
-	std::string combined;
 	for (size_t i = 0; i < texts.size(); ++i) {
-		combined += texts[i];
-		if (i < texts.size() - 1) {
-			combined += ctx->sep_text;
-		}
-	}
-	// Add one final separator at the end of the whole chain for looping
-	combined += ctx->sep_text;
+		std::string text_with_sep = texts[i] + ctx->sep_text;
 
-	// Split the combined string only if it's too long
-	std::vector<std::string> chunks;
-	int estimated_char_width = ctx->font_size / 2;
-	if (estimated_char_width < 1)
-		estimated_char_width = 1;
-	int max_chars = MAX_PIXEL_WIDTH / estimated_char_width;
-	if (max_chars < 1)
-		max_chars = 1;
-
-	if ((int)combined.length() <= max_chars) {
-		chunks.push_back(combined);
-	} else {
-		std::string temp = combined;
-		while ((int)temp.length() > max_chars) {
-			chunks.push_back(temp.substr(0, max_chars));
-			temp = temp.substr(max_chars);
-		}
-		if (!temp.empty())
-			chunks.push_back(temp);
-	}
-
-	for (size_t i = 0; i < chunks.size(); ++i) {
 		char name[128];
 		snprintf(name, sizeof(name), "ticker_item_%llu_%zu", (unsigned long long)++chain_counter, i);
 		obs_source_t *ms = obs_source_create_private("text_ft2_source", name, nullptr);
 		if (ms) {
-			ft2_push(ms, chunks[i].c_str(), ctx->font_face.c_str(), ctx->font_style.c_str(), ctx->font_size,
-				 ctx->text_color);
+			ft2_push(ms, text_with_sep.c_str(), ctx->font_face.c_str(), ctx->font_style.c_str(),
+				 ctx->font_size, ctx->text_color);
 
 			float w = (float)obs_source_get_width(ms) * ctx->scale_x;
 			chain.width += w;
-		}
 
-		TickerItem item;
-		item.source = ms;
-		item.show_separator = false; // Separators are now baked into the string
-		chain.items.push_back(item);
+			TickerItem item;
+			item.source = ms;
+			item.show_separator = false; // Baked into string for simplicity
+			chain.items.push_back(item);
+		}
 	}
 }
 
@@ -162,6 +130,12 @@ static void destroy_chain(TickerChain &chain)
 	chain.items.clear();
 }
 
+static void update_chain_style(struct ticker_source *ctx)
+{
+	std::lock_guard<std::mutex> lock(ctx->results_mutex);
+	ctx->style_update_requested = true;
+}
+
 // Refresh chain layout (e.g. if scale changed or width was 0 initially)
 static void update_chain_width(struct ticker_source *ctx, TickerChain &chain)
 {
@@ -175,26 +149,6 @@ static void update_chain_width(struct ticker_source *ctx, TickerChain &chain)
 			chain.width += (float)obs_source_get_width(item.source) * ctx->scale_x;
 		if (item.show_separator)
 			chain.width += sep_w;
-	}
-}
-
-// Helper to update style of existing chains
-static void update_chain_style(struct ticker_source *ctx)
-{
-	for (auto &chain : ctx->active_chains) {
-		for (auto &item : chain.items) {
-			if (!item.source)
-				continue;
-			obs_data_t *s = obs_source_get_settings(item.source);
-			const char *txt = obs_data_get_string(s, "text");
-			if (txt) {
-				ft2_push(item.source, txt, ctx->font_face.c_str(), ctx->font_style.c_str(),
-					 ctx->font_size, ctx->text_color);
-			}
-			obs_data_release(s);
-		}
-		// Reset width so it gets recalculated in tick
-		chain.width = 0.0f;
 	}
 }
 
@@ -231,10 +185,22 @@ static void *ticker_create(obs_data_t *settings, obs_source_t *source)
 static void ticker_destroy(void *data)
 {
 	auto *ctx = (struct ticker_source *)data;
+
 	for (auto &chain : ctx->active_chains) {
 		destroy_chain(chain);
 	}
 	ctx->active_chains.clear();
+
+	// Clear any orphaned data in queues
+	{
+		std::lock_guard<std::mutex> lock(ctx->results_mutex);
+		ctx->pending_chain_requests.clear();
+	}
+
+	for (auto &chain : ctx->dead_chains) {
+		destroy_chain(chain);
+	}
+	ctx->dead_chains.clear();
 
 	if (ctx->sep_source)
 		obs_source_release(ctx->sep_source);
@@ -332,19 +298,11 @@ static void ticker_update(void *data, obs_data_t *settings)
 		update_chain_style(ctx);
 	}
 
-	// Push separator
-	bool force_sep = (ctx->sep_source && obs_source_get_width(ctx->sep_source) == 0);
-	if ((sep_dirty || force_sep) && ctx->sep_source)
-		ft2_push(ctx->sep_source, ctx->sep_text.c_str(), ctx->font_face.c_str(), ctx->font_style.c_str(),
-			 ctx->font_size, ctx->text_color);
-
-	if (clock_dirty && ctx->clock_source)
-		ft2_push(ctx->clock_source, current_time_str(ctx->clock_24h).c_str(), ctx->font_face.c_str(),
-			 ctx->font_style.c_str(), ctx->clock_font_size, ctx->text_color);
-
-	if (font_dirty && ctx->height_ref_source)
-		ft2_push(ctx->height_ref_source, "|Tgj_0123", ctx->font_face.c_str(), ctx->font_style.c_str(),
-			 ctx->font_size, ctx->text_color);
+	// Signal style update on graphics thread
+	if (font_dirty || sep_dirty || clock_dirty) {
+		std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+		ctx->style_update_requested = true;
+	}
 }
 
 /* ── Tick ─────────────────────────────────────────────────────────── */
@@ -356,10 +314,69 @@ static void ticker_video_tick(void *data, float seconds)
 	auto *ctx = (struct ticker_source *)data;
 	std::lock_guard<std::mutex> lock(ctx->mutex);
 
-	float scroll_area = ctx->show_clock ? (float)(1920 - ctx->clock_zone_width) : 1920.0f;
+	// 0. Garbage Collection: Safely destroy sources released in previous ticks.
+	// Since we are on the graphics thread and hold the mutex, this is safe.
+	while (!ctx->dead_chains.empty()) {
+		TickerChain c = std::move(ctx->dead_chains.front());
+		ctx->dead_chains.pop_front();
+		destroy_chain(c);
+	}
 
-	// Seamless content tracking
-	// We'll handle additions and next-loop updates below.
+	// 1. Process deferred data requests from worker
+	{
+		std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+
+		// Clock
+		if (ctx->clock_update_requested && ctx->clock_source) {
+			ft2_push(ctx->clock_source, ctx->pending_clock_text.c_str(), ctx->font_face.c_str(),
+				 ctx->font_style.c_str(), ctx->clock_font_size, ctx->text_color);
+			ctx->clock_update_requested = false;
+		}
+
+		// Style
+		if (ctx->style_update_requested) {
+			if (ctx->sep_source) {
+				ft2_push(ctx->sep_source, ctx->sep_text.c_str(), ctx->font_face.c_str(),
+					 ctx->font_style.c_str(), ctx->font_size, ctx->text_color);
+			}
+			if (ctx->height_ref_source) {
+				ft2_push(ctx->height_ref_source, "|Tgj_0123", ctx->font_face.c_str(),
+					 ctx->font_style.c_str(), ctx->font_size, ctx->text_color);
+			}
+			if (ctx->clock_source) {
+				ft2_push(ctx->clock_source, current_time_str(ctx->clock_24h).c_str(),
+					 ctx->font_face.c_str(), ctx->font_style.c_str(), ctx->clock_font_size,
+					 ctx->text_color);
+			}
+
+			// Update existing chain items (PRESERVE TEXT!)
+			for (auto &c : ctx->active_chains) {
+				for (auto &item : c.items) {
+					if (item.source) {
+						obs_data_t *settings = obs_source_get_settings(item.source);
+						const char *txt = obs_data_get_string(settings, "text");
+						if (txt && txt[0] != '\0') {
+							ft2_push(item.source, txt, ctx->font_face.c_str(),
+								 ctx->font_style.c_str(), ctx->font_size,
+								 ctx->text_color);
+						}
+						obs_data_release(settings);
+					}
+				}
+				update_chain_width(ctx, c);
+			}
+			ctx->style_update_requested = false;
+		}
+	}
+
+	// Get actual canvas width
+	struct obs_video_info ovi;
+	float base_width = 1920.0f;
+	if (obs_get_video_info(&ovi)) {
+		base_width = (float)ovi.base_width;
+	}
+
+	float scroll_area = ctx->show_clock ? (base_width - (float)ctx->clock_zone_width) : base_width;
 
 	// ── Edge-detect is_live changes ──
 	if (ctx->is_live && !ctx->prev_is_live) {
@@ -372,63 +389,17 @@ static void ticker_video_tick(void *data, float seconds)
 		if (ctx->anim_state == TickerAnim::RUNNING || ctx->anim_state == TickerAnim::ENTERING) {
 			ctx->anim_state = TickerAnim::DRAINING;
 
-			// Prune individual items that haven't entered the screen yet
-			// This ensures we don't scroll through the rest of a long chain
-			for (auto &chain : ctx->active_chains) {
-				float x_offset = 0.0f;
-				float sep_w = 0.0f;
-				if (ctx->sep_source)
-					sep_w = (float)obs_source_get_width(ctx->sep_source) * ctx->scale_x;
-
-				auto it = chain.items.begin();
-				while (it != chain.items.end()) {
-					obs_source_t *src = it->source;
-					float item_w = 0.0f;
-					if (src)
-						item_w = (float)obs_source_get_width(src) * ctx->scale_x;
-
-					// Screen position of this item start
-					float item_screen_x = chain.x + x_offset;
-
-					// Calculate offset for next item
-					float current_segment_w = item_w;
-					if (it->show_separator)
-						current_segment_w += sep_w;
-					x_offset += current_segment_w;
-
-					// Exit Logic
-					if (item_screen_x >= scroll_area) {
-						while (it != chain.items.end()) {
-							if (it->source)
-								obs_source_release(it->source);
-							it = chain.items.erase(it);
-						}
-						break; // Chain truncated
-					} else {
-						++it;
-					}
-				}
-
-				// Recalculate width
-				chain.width = 0.0f;
-				for (auto &item : chain.items) {
-					if (item.source)
-						chain.width += (float)obs_source_get_width(item.source) * ctx->scale_x;
-					if (item.show_separator)
-						chain.width += sep_w;
-				}
+			// Clear ready chains to stop new content from appearing
+			{
+				std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+				ctx->pending_chain_requests.clear();
 			}
 
-			// Also prune whole chains if they became empty or were already off-screen
+			// Purge completely off-screen tails to ensure "Once and Drain"
 			auto it = ctx->active_chains.begin();
 			while (it != ctx->active_chains.end()) {
-				// If chain is empty OR chain has completely passed the left edge
-				if (it->items.empty() || (it->x + it->width < 0.0f)) {
-					destroy_chain(*it);
-					it = ctx->active_chains.erase(it);
-				} else if (it->x >= scroll_area) {
-					// Chain hasn't entered yet
-					destroy_chain(*it);
+				if (it->x >= scroll_area) {
+					ctx->dead_chains.push_back(std::move(*it));
 					it = ctx->active_chains.erase(it);
 				} else {
 					++it;
@@ -459,10 +430,11 @@ static void ticker_video_tick(void *data, float seconds)
 			if (ctx->active_chains.empty()) {
 				// Seed initial chain
 				if (!ctx->pending_msg_texts.empty()) {
-					TickerChain chain = create_chain(ctx, ctx->pending_msg_texts);
-					chain.x = scroll_area;
 					ctx->current_msg_texts = ctx->pending_msg_texts; // Update snapshot
-					ctx->active_chains.push_back(chain);
+					std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+					for (const auto &txt : ctx->pending_msg_texts) {
+						ctx->pending_chain_requests.push_back({txt});
+					}
 				}
 			}
 		}
@@ -472,9 +444,9 @@ static void ticker_video_tick(void *data, float seconds)
 		if (ctx->slide_t >= 1.0f) {
 			ctx->slide_t = 1.0f;
 			ctx->anim_state = TickerAnim::HIDDEN;
-			// Clear chains
-			for (auto &c : ctx->active_chains)
-				destroy_chain(c);
+			for (auto &c : ctx->active_chains) {
+				ctx->dead_chains.push_back(std::move(c));
+			}
 			ctx->active_chains.clear();
 		}
 		break;
@@ -484,6 +456,18 @@ static void ticker_video_tick(void *data, float seconds)
 
 		// ── Seamless Content Update ──
 		if (ctx->pending_msg_texts != ctx->current_msg_texts) {
+			// 1. Unified Purge: To achieve "Once and Drain", preserve all visible content
+			// and destroy the entire pre-spawned tail that hasn't entered the screen yet.
+			auto it = ctx->active_chains.begin();
+			while (it != ctx->active_chains.end()) {
+				if (it->x >= scroll_area) {
+					ctx->dead_chains.push_back(std::move(*it));
+					it = ctx->active_chains.erase(it);
+				} else {
+					++it;
+				}
+			}
+
 			bool is_pure_addition = (ctx->pending_msg_texts.size() > ctx->current_msg_texts.size());
 			if (is_pure_addition) {
 				for (size_t i = 0; i < ctx->current_msg_texts.size(); ++i) {
@@ -494,46 +478,51 @@ static void ticker_video_tick(void *data, float seconds)
 				}
 			}
 
-			if (is_pure_addition) {
-				// Append logic: If the last chain hasn't entered yet, we can grow it.
+			// Append logic: Only run if currently LIVE.
+			if (is_pure_addition && ctx->is_live) {
 				if (!ctx->active_chains.empty()) {
 					TickerChain &back = ctx->active_chains.back();
-					if (back.x + back.width > scroll_area) {
+					if (back.x + back.width > 0.0f) {
 						std::vector<std::string> new_items;
 						for (size_t i = ctx->current_msg_texts.size();
 						     i < ctx->pending_msg_texts.size(); ++i) {
 							new_items.push_back(ctx->pending_msg_texts[i]);
 						}
-						append_texts_to_chain(ctx, back, new_items);
+						{
+							std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+							for (const auto &txt : new_items) {
+								ctx->pending_chain_requests.push_back({txt});
+							}
+						}
 						ctx->current_msg_texts = ctx->pending_msg_texts;
 					}
 				} else {
 					ctx->current_msg_texts = ctx->pending_msg_texts;
 				}
 			} else {
-				// Removal/Change: Prune off-screen items from all existing chains.
-				// This allows on-screen items to finish their pass ("drain out").
-				for (auto &chain : ctx->active_chains) {
-					float x_offset = 0.0f;
-					auto it = chain.items.begin();
-					while (it != chain.items.end()) {
-						float item_w = (float)obs_source_get_width(it->source) * ctx->scale_x;
-						if (chain.x + x_offset >= scroll_area) {
-							// Item starts off-screen: remove it and everything after.
-							while (it != chain.items.end()) {
-								if (it->source)
-									obs_source_release(it->source);
-								it = chain.items.erase(it);
-							}
-							break;
-						}
-						x_offset += item_w;
-						++it;
-					}
-					// Re-measure width
-					chain.width = x_offset;
-				}
+				// Removal/Change (or addition while not live):
+				// Just update snapshot; the loop will spawn the new queue naturally after current clear.
 				ctx->current_msg_texts = ctx->pending_msg_texts;
+			}
+		}
+
+		// Pick up ready chains from worker
+		{
+			std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+			while (!ctx->pending_chain_requests.empty()) {
+				std::vector<std::string> texts = std::move(ctx->pending_chain_requests.front());
+				ctx->pending_chain_requests.pop_front();
+
+				TickerChain chain = create_chain(ctx, texts);
+
+				// Positioning
+				if (ctx->active_chains.empty()) {
+					chain.x = scroll_area;
+				} else {
+					TickerChain &back = ctx->active_chains.back();
+					chain.x = back.x + back.width;
+				}
+				ctx->active_chains.push_back(std::move(chain));
 			}
 		}
 
@@ -577,10 +566,7 @@ static void ticker_video_tick(void *data, float seconds)
 		if (!ctx->active_chains.empty()) {
 			TickerChain &front = ctx->active_chains.front();
 			if (front.x + front.width < 0.0f) {
-				// If draining, just destroy.
-				// If running, we might recycle if content matches pending?
-				// For simplicity, just destroy. We create new at end.
-				destroy_chain(front);
+				ctx->dead_chains.push_back(std::move(front));
 				ctx->active_chains.pop_front();
 			}
 		}
@@ -626,10 +612,11 @@ static void ticker_video_tick(void *data, float seconds)
 
 			// If rightmost edge is visible (or close to entering), append next chain
 			if (should_add) {
-				TickerChain chain = create_chain(ctx, ctx->pending_msg_texts);
-				chain.x = rightmost_edge;
 				ctx->current_msg_texts = ctx->pending_msg_texts;
-				ctx->active_chains.push_back(chain);
+				std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+				for (const auto &txt : ctx->pending_msg_texts) {
+					ctx->pending_chain_requests.push_back({txt});
+				}
 			}
 		}
 
@@ -639,13 +626,16 @@ static void ticker_video_tick(void *data, float seconds)
 		}
 	}
 
-	// Clock update
+	// Clock update: offload to worker
 	ctx->clock_timer += seconds;
 	if (ctx->clock_timer >= 1.0f) {
 		ctx->clock_timer -= 1.0f;
-		if (ctx->clock_source)
-			ft2_push(ctx->clock_source, current_time_str(ctx->clock_24h).c_str(), ctx->font_face.c_str(),
-				 ctx->font_style.c_str(), ctx->clock_font_size, ctx->text_color);
+		if (ctx->clock_source) {
+			std::string time_str = current_time_str(ctx->clock_24h);
+			std::lock_guard<std::mutex> lock_r(ctx->results_mutex);
+			ctx->pending_clock_text = time_str;
+			ctx->clock_update_requested = true;
+		}
 	}
 
 	// Report runtime state
@@ -673,8 +663,17 @@ static void ticker_video_render(void *data, gs_effect_t *)
 	auto *ctx = (struct ticker_source *)data;
 	std::lock_guard<std::mutex> lock(ctx->mutex);
 
+	struct obs_video_info ovi;
+	float base_width = 1920.0f;
+	if (obs_get_video_info(&ovi)) {
+		base_width = (float)ovi.base_width;
+	}
+
 	float bar_h = (float)ctx->bar_height;
-	float scroll_w = ctx->show_clock ? (float)(1920 - ctx->clock_zone_width) : 1920.0f;
+	float scroll_w = ctx->show_clock ? (base_width - (float)ctx->clock_zone_width) : base_width;
+
+	if (ctx->anim_state == TickerAnim::HIDDEN && ctx->slide_t <= 0.0f)
+		return;
 
 	// Clock zone
 	if (ctx->show_clock) {
@@ -750,6 +749,13 @@ static void ticker_video_render(void *data, gs_effect_t *)
 
 	// Re-draw clock zone on top to mask text
 	if (ctx->show_clock) {
+		struct obs_video_info ovi;
+		float base_width = 1920.0f;
+		if (obs_get_video_info(&ovi)) {
+			base_width = (float)ovi.base_width;
+		}
+		float scroll_w = base_width - (float)ctx->clock_zone_width;
+
 		gs_matrix_push();
 		gs_matrix_translate3f(scroll_w, 0.0f, 0.0f);
 		draw_rect(ctx->bg_color, (float)ctx->clock_zone_width, bar_h);

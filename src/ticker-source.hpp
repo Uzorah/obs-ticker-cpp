@@ -1,10 +1,16 @@
-#pragma once
-
-#include <obs-module.h>
 #include <deque>
 #include <vector>
 #include <string>
 #include <mutex>
+
+// Forward declarations for OBS types to help IDE if headers are missing
+struct obs_source;
+typedef struct obs_source obs_source_t;
+struct obs_data;
+typedef struct obs_data obs_data_t;
+struct obs_source_info;
+
+#include <obs-module.h>
 
 enum class TickerAnim {
 	HIDDEN,       // Bar off-screen below
@@ -89,6 +95,16 @@ struct ticker_source {
 	/* Clock divider */
 	uint32_t clock_sep_color = 0xFFFFFFFF;
 	int clock_sep_width = 6;
+
+	/* DEFERRED Data Queues (only data, no sources here) */
+	std::mutex results_mutex;
+	std::deque<std::vector<std::string>> pending_chain_requests;
+	std::string pending_clock_text;
+	bool clock_update_requested = false;
+	bool style_update_requested = false;
+
+	// Delayed destruction (must happen on graphics thread)
+	std::deque<TickerChain> dead_chains;
 
 	/* State reporting */
 	int last_reported_state = -1;
