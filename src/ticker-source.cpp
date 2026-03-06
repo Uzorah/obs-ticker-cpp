@@ -331,6 +331,7 @@ static void ticker_video_tick(void *data, float seconds)
 			ft2_push(ctx->clock_source, ctx->pending_clock_text.c_str(), ctx->font_face.c_str(),
 				 ctx->font_style.c_str(), ctx->clock_font_size, ctx->text_color);
 			ctx->clock_update_requested = false;
+			ctx->clock_frames_alive = 0; // Reset for texture safety
 		}
 
 		// Style
@@ -347,6 +348,7 @@ static void ticker_video_tick(void *data, float seconds)
 				ft2_push(ctx->clock_source, current_time_str(ctx->clock_24h).c_str(),
 					 ctx->font_face.c_str(), ctx->font_style.c_str(), ctx->clock_font_size,
 					 ctx->text_color);
+				ctx->clock_frames_alive = 0; // Reset
 			}
 
 			// Update existing chain items (PRESERVE TEXT!)
@@ -364,6 +366,7 @@ static void ticker_video_tick(void *data, float seconds)
 					}
 				}
 				update_chain_width(ctx, c);
+				c.frames_alive = 0; // Reset for texture safety
 			}
 			ctx->style_update_requested = false;
 		}
@@ -654,6 +657,41 @@ static void ticker_video_tick(void *data, float seconds)
 			ctx->last_reported_state = current_state;
 		}
 	}
+
+	// Increment frame counters (giving GPU time to upload textures)
+	for (auto &c : ctx->active_chains) {
+		c.frames_alive++;
+	}
+	ctx->clock_frames_alive++;
+}
+
+static void render_clock(struct ticker_source *ctx, float scroll_w, float bar_h)
+{
+	if (!ctx->clock_source)
+		return;
+
+	// Texture safety: Wait at least 1 frame after update
+	if (ctx->clock_frames_alive < 1)
+		return;
+
+	uint32_t raw_cw = obs_source_get_width(ctx->clock_source);
+	uint32_t raw_ch = obs_source_get_height(ctx->clock_source);
+
+	// Only render if texture is ready (> 1px)
+	if (raw_cw <= 1 || raw_ch <= 1)
+		return;
+
+	float cw = (float)raw_cw * ctx->clock_scale_x;
+	float ch = (float)raw_ch * ctx->clock_scale_y;
+	float cx = scroll_w + 6.0f + ((float)ctx->clock_zone_width - 6.0f - cw) * 0.5f;
+	float visual_adj = ch * 0.12f;
+	float cy = (bar_h - ch) * 0.5f + (float)ctx->vertical_offset - visual_adj;
+
+	gs_matrix_push();
+	gs_matrix_translate3f(cx, cy, 0.0f);
+	gs_matrix_scale3f(ctx->clock_scale_x, ctx->clock_scale_y, 1.0f);
+	obs_source_video_render(ctx->clock_source);
+	gs_matrix_pop();
 }
 
 /* ── Render ───────────────────────────────────────────────────────── */
@@ -683,18 +721,7 @@ static void ticker_video_render(void *data, gs_effect_t *)
 		draw_rect(ctx->clock_sep_color, 6.0f, bar_h);
 		gs_matrix_pop();
 
-		if (ctx->clock_source) {
-			float cw = (float)obs_source_get_width(ctx->clock_source) * ctx->clock_scale_x;
-			float ch = (float)obs_source_get_height(ctx->clock_source) * ctx->clock_scale_y;
-			float cx = scroll_w + 6.0f + ((float)ctx->clock_zone_width - 6.0f - cw) * 0.5f;
-			float visual_adj = ch * 0.12f; // Visual adjustment for font baseline
-			float cy = (bar_h - ch) * 0.5f + (float)ctx->vertical_offset - visual_adj;
-			gs_matrix_push();
-			gs_matrix_translate3f(cx, cy, 0.0f);
-			gs_matrix_scale3f(ctx->clock_scale_x, ctx->clock_scale_y, 1.0f);
-			obs_source_video_render(ctx->clock_source);
-			gs_matrix_pop();
-		}
+		render_clock(ctx, scroll_w, bar_h);
 	}
 
 	if (ctx->anim_state == TickerAnim::HIDDEN)
@@ -709,6 +736,10 @@ static void ticker_video_render(void *data, gs_effect_t *)
 
 	// Render chains
 	for (auto &chain : ctx->active_chains) {
+		// Texture safety: Wait 1 frame for GPU upload
+		if (chain.frames_alive < 1)
+			continue;
+
 		if (chain.x > scroll_w || chain.x + chain.width < 0)
 			continue;
 
@@ -762,18 +793,7 @@ static void ticker_video_render(void *data, gs_effect_t *)
 		draw_rect(ctx->clock_sep_color, 6.0f, bar_h);
 		gs_matrix_pop();
 
-		if (ctx->clock_source) {
-			float cw = (float)obs_source_get_width(ctx->clock_source) * ctx->clock_scale_x;
-			float ch = (float)obs_source_get_height(ctx->clock_source) * ctx->clock_scale_y;
-			float cx = scroll_w + 6.0f + ((float)ctx->clock_zone_width - 6.0f - cw) * 0.5f;
-			float visual_adj = ch * 0.12f;
-			float cy = (bar_h - ch) * 0.5f + (float)ctx->vertical_offset - visual_adj;
-			gs_matrix_push();
-			gs_matrix_translate3f(cx, cy, 0.0f);
-			gs_matrix_scale3f(ctx->clock_scale_x, ctx->clock_scale_y, 1.0f);
-			obs_source_video_render(ctx->clock_source);
-			gs_matrix_pop();
-		}
+		render_clock(ctx, scroll_w, bar_h);
 	}
 }
 

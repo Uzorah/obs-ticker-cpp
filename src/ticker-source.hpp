@@ -29,7 +29,8 @@ struct TickerItem {
 struct TickerChain {
 	std::vector<TickerItem> items; // Includes text sources and separators config
 	float width = 0.0f;
-	float x = 0.0f; // Current position relative to screen 0
+	float x = 0.0f;       // Current position relative to screen 0
+	int frames_alive = 0; // Counts frames since creation for texture safety
 };
 
 struct ticker_source {
@@ -91,6 +92,7 @@ struct ticker_source {
 	float clock_timer = 0.0f;
 	std::string last_clock_text;
 	int clock_zone_width = 170;
+	int clock_frames_alive = 0; // For texture safety
 
 	/* Clock divider */
 	uint32_t clock_sep_color = 0xFFFFFFFF;
